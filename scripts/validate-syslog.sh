@@ -4,66 +4,18 @@
 #
 # Validates rsyslog as the required centralized logging layer.
 #
-# Purpose:
-#  - Confirm the rsyslog service is installed and running
-#  - Confirm the remote log directory exists
-#  - Configure rsyslog to receive remote syslog on UDP 514
-#  - Optionally configure TCP 514
-#  - Confirm rsyslog configuration is syntactically valid
-#  - Restart rsyslog after configuration changes
-#  - Confirm port 514 is listening
-#  - Send a test syslog message
-#  - Confirm a test log file is written to disk
-#
-# Design:
-#  - Treat this script as the hard validation gate for the logging stack
-#  - Fail fast on critical validation failures
-#  - Use shared library helpers where possible
-#  - Keep stack-specific validation logic in this script, not the library
-#
-# Preconditions:
-#  - Script is run with sufficient privileges
-#  - install-rsyslog.sh completed successfully
-#  - Shared library files are present and sourceable
-#
-# Postconditions:
-#  - rsyslog remote reception is configured
-#  - rsyslog configuration is validated
-#  - rsyslog is listening on UDP 514
-#  - test log message is written under /var/log/remote/
-#
-# Returns:
-#  - 0 if rsyslog validation succeeds
-#  - 1 is not used directly by this script as a final exit state
-#  - 2 if a critical validation step fails
-#
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# ------------------------------------------------------------------------------
-# External reusable library location
-# ------------------------------------------------------------------------------
-# Priority:
-#   1. LIB_DIR environment variable, if exported by caller
-#   2. Default shared reusable library path
-#
-# Example:
-#   export LIB_DIR="/home/graylog/infra-bash-lib"
-#   sudo ./scripts/validate-rsyslog.sh
-#
 readonly DEFAULT_LIB_DIR="/home/graylog/infra-bash-lib"
 readonly LIB_DIR="${LIB_DIR:-${DEFAULT_LIB_DIR}}"
 
 COMMON_LIB="${LIB_DIR}/common.sh"
 SERVICE_LIB="${LIB_DIR}/service.sh"
 SYSTEM_LIB="${LIB_DIR}/system.sh"
-
-# ------------------------------------------------------------------------------
-# Library loading
-# ------------------------------------------------------------------------------
 
 [[ -f "${COMMON_LIB}"  ]] || { echo "[FAIL] Missing library: ${COMMON_LIB}"; exit 2; }
 [[ -f "${SERVICE_LIB}" ]] || { echo "[FAIL] Missing library: ${SERVICE_LIB}"; exit 2; }
@@ -76,20 +28,12 @@ source "${SERVICE_LIB}"
 # shellcheck source=/dev/null
 source "${SYSTEM_LIB}"
 
-# ------------------------------------------------------------------------------
-# Constants
-# ------------------------------------------------------------------------------
-
 readonly RSYSLOG_SERVICE="rsyslog"
 readonly RSYSLOG_CONFIG_FILE="/etc/rsyslog.d/10-remote.conf"
 readonly REMOTE_LOG_DIR="/var/log/remote"
 readonly TEST_MESSAGE_TAG="rsyslog-validation"
 readonly TEST_MESSAGE="rsyslog validation test message"
 readonly ENABLE_TCP_SYSLOG="${ENABLE_TCP_SYSLOG:-0}"
-
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
 
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
@@ -197,21 +141,53 @@ restart_rsyslog_service() {
     return 0
 }
 
+is_udp_514_listening_with_ss() {
+    ss -H -lun 2>/dev/null | awk '
+        $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+is_tcp_514_listening_with_ss() {
+    ss -H -ltn 2>/dev/null | awk '
+        $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+is_udp_514_listening_with_netstat() {
+    netstat -lun 2>/dev/null | awk '
+        $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+is_tcp_514_listening_with_netstat() {
+    netstat -ltn 2>/dev/null | awk '
+        $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
 check_syslog_port() {
     step "Phase 7 — Listener validation"
 
     if command_exists ss >/dev/null 2>&1; then
-        if ss -lun | awk '{print $5}' | grep -Eq '(^|:)514$'; then
+        if is_udp_514_listening_with_ss; then
             pass "UDP 514 is listening"
         else
+            warn "Current UDP listeners from ss:"
+            ss -lun 2>/dev/null || true
             fail "UDP 514 is not listening"
             return 2
         fi
 
         if [[ "${ENABLE_TCP_SYSLOG}" == "1" ]]; then
-            if ss -ltn | awk '{print $4}' | grep -Eq '(^|:)514$'; then
+            if is_tcp_514_listening_with_ss; then
                 pass "TCP 514 is listening"
             else
+                warn "Current TCP listeners from ss:"
+                ss -ltn 2>/dev/null || true
                 fail "TCP 514 is not listening"
                 return 2
             fi
@@ -221,17 +197,21 @@ check_syslog_port() {
     fi
 
     if command_exists netstat >/dev/null 2>&1; then
-        if netstat -lun 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)514$'; then
+        if is_udp_514_listening_with_netstat; then
             pass "UDP 514 is listening"
         else
+            warn "Current UDP listeners from netstat:"
+            netstat -lun 2>/dev/null || true
             fail "UDP 514 is not listening"
             return 2
         fi
 
         if [[ "${ENABLE_TCP_SYSLOG}" == "1" ]]; then
-            if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)514$'; then
+            if is_tcp_514_listening_with_netstat; then
                 pass "TCP 514 is listening"
             else
+                warn "Current TCP listeners from netstat:"
+                netstat -ltn 2>/dev/null || true
                 fail "TCP 514 is not listening"
                 return 2
             fi
@@ -247,27 +227,27 @@ check_syslog_port() {
 send_test_message() {
     step "Phase 8 — Test message injection"
 
-    logger -n 127.0.0.1 -P 514 -d -t "${TEST_MESSAGE_TAG}" -- "${TEST_MESSAGE}"
-    if [[ $? -ne 0 ]]; then
-        fail "Failed to send test syslog message"
-        return 2
+    if logger -n 127.0.0.1 -P 514 -d -t "${TEST_MESSAGE_TAG}" -- "${TEST_MESSAGE}"; then
+        pass "Test syslog message sent"
+        return 0
     fi
 
-    pass "Test syslog message sent"
-    return 0
+    fail "Failed to send test syslog message"
+    return 2
 }
 
 verify_test_log_written() {
     step "Phase 9 — Log write validation"
 
-    local test_log_file="${REMOTE_LOG_DIR}/127.0.0.1/${TEST_MESSAGE_TAG}.log"
-
     sleep 2
 
-    if [[ ! -f "${test_log_file}" ]]; then
-        warn "Expected test log file not found at: ${test_log_file}"
-        info "Searching for matching validation message under ${REMOTE_LOG_DIR}"
+    if grep -R --line-number --fixed-strings "${TEST_MESSAGE}" "${REMOTE_LOG_DIR}" >/dev/null 2>&1; then
+        pass "Validation test message was written to disk"
+        return 0
     fi
+
+    warn "No validation message found yet, retrying once"
+    sleep 2
 
     if grep -R --line-number --fixed-strings "${TEST_MESSAGE}" "${REMOTE_LOG_DIR}" >/dev/null 2>&1; then
         pass "Validation test message was written to disk"
