@@ -42,7 +42,20 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-LIB_DIR="${PROJECT_ROOT}/lib"
+
+# ------------------------------------------------------------------------------
+# External reusable library location
+# ------------------------------------------------------------------------------
+# Priority:
+#   1. LIB_DIR environment variable, if exported by caller
+#   2. Default shared reusable library path
+#
+# Example:
+#   export LIB_DIR="/home/graylog/infra-bash-lib"
+#   sudo ./scripts/validate-rsyslog.sh
+#
+readonly DEFAULT_LIB_DIR="/home/graylog/infra-bash-lib"
+readonly LIB_DIR="${LIB_DIR:-${DEFAULT_LIB_DIR}}"
 
 COMMON_LIB="${LIB_DIR}/common.sh"
 SERVICE_LIB="${LIB_DIR}/service.sh"
@@ -70,7 +83,6 @@ source "${SYSTEM_LIB}"
 readonly RSYSLOG_SERVICE="rsyslog"
 readonly RSYSLOG_CONFIG_FILE="/etc/rsyslog.d/10-remote.conf"
 readonly REMOTE_LOG_DIR="/var/log/remote"
-readonly TEST_HOSTNAME="rsyslog-validation-host"
 readonly TEST_MESSAGE_TAG="rsyslog-validation"
 readonly TEST_MESSAGE="rsyslog validation test message"
 readonly ENABLE_TCP_SYSLOG="${ENABLE_TCP_SYSLOG:-0}"
@@ -95,12 +107,12 @@ require_commands() {
     command_exists rsyslogd || return 2
     command_exists logger || return 2
 
-    if command_exists ss >/dev/null; then
+    if command_exists ss >/dev/null 2>&1; then
         pass "Socket inspection command available: ss"
         return 0
     fi
 
-    if command_exists netstat >/dev/null; then
+    if command_exists netstat >/dev/null 2>&1; then
         pass "Socket inspection command available: netstat"
         return 0
     fi
@@ -140,7 +152,6 @@ write_rsyslog_remote_config() {
 
 module(load="imudp")
 input(type="imudp" port="514")
-
 $(if [[ "${ENABLE_TCP_SYSLOG}" == "1" ]]; then
 cat <<'TCPBLOCK'
 module(load="imtcp")
@@ -189,7 +200,7 @@ restart_rsyslog_service() {
 check_syslog_port() {
     step "Phase 7 — Listener validation"
 
-    if command_exists ss >/dev/null; then
+    if command_exists ss >/dev/null 2>&1; then
         if ss -lun | awk '{print $5}' | grep -Eq '(^|:)514$'; then
             pass "UDP 514 is listening"
         else
@@ -209,7 +220,7 @@ check_syslog_port() {
         return 0
     fi
 
-    if command_exists netstat >/dev/null; then
+    if command_exists netstat >/dev/null 2>&1; then
         if netstat -lun 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)514$'; then
             pass "UDP 514 is listening"
         else
@@ -270,6 +281,7 @@ verify_test_log_written() {
 print_success_summary() {
     step "Validation Summary"
 
+    pass "Using shared library path: ${LIB_DIR}"
     pass "rsyslog is installed and running"
     pass "Remote syslog reception is configured"
     pass "Port 514 listener validation passed"
