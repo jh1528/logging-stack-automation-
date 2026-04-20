@@ -39,7 +39,20 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-LIB_DIR="${PROJECT_ROOT}/lib"
+
+# ------------------------------------------------------------------------------
+# External reusable library location
+# ------------------------------------------------------------------------------
+# Priority:
+#   1. LIB_DIR environment variable, if exported by caller
+#   2. Default shared reusable library path
+#
+# Example:
+#   export LIB_DIR="/home/graylog/infra-bash-lib"
+#   sudo ./scripts/install-rsyslog.sh
+#
+readonly DEFAULT_LIB_DIR="/home/graylog/infra-bash-lib"
+readonly LIB_DIR="${LIB_DIR:-${DEFAULT_LIB_DIR}}"
 
 COMMON_LIB="${LIB_DIR}/common.sh"
 APT_LIB="${LIB_DIR}/apt.sh"
@@ -157,6 +170,7 @@ prepare_rsyslog_runtime() {
 print_next_steps() {
     step "Next Step"
 
+    info "Using shared library path: ${LIB_DIR}"
     info "rsyslog installation stage completed successfully"
     info "Run the next stage script: scripts/validate-rsyslog.sh"
     info "That script should verify listener ports, config load, and log writes"
