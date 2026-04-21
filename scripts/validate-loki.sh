@@ -143,18 +143,15 @@ return 2
 }
 
 build_validation_payload() {
-local timestamp_ns="$1"
-local test_message="$2"
+    local timestamp_ns="$1"
+    local test_message="$2"
 
-```
-if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
-    fail "Usage: build_validation_payload <timestamp_ns> <test_message>"
-    return 2
-fi
+    if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
+        fail "Usage: build_validation_payload <timestamp_ns> <test_message>"
+        return 2
+    fi
 
-python3 - "$timestamp_ns" "$test_message" <<'PY'
-```
-
+    python3 - "$timestamp_ns" "$test_message" <<EOF
 import json
 import sys
 
@@ -162,23 +159,22 @@ timestamp_ns = sys.argv[1]
 test_message = sys.argv[2]
 
 payload = {
-"streams": [
-{
-"stream": {
-"job": "loki-validation",
-"source": "validate-loki.sh",
-},
-"values": [
-[timestamp_ns, test_message]
-],
-}
-]
+    "streams": [
+        {
+            "stream": {
+                "job": "loki-validation",
+                "source": "validate-loki.sh"
+            },
+            "values": [
+                [timestamp_ns, test_message]
+            ]
+        }
+    ]
 }
 
 print(json.dumps(payload, separators=(",", ":")))
-PY
+EOF
 }
-
 push_validation_log() {
 step "Pushing Loki validation log entry"
 
