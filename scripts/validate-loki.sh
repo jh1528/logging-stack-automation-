@@ -152,7 +152,7 @@ if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
 	return 2
 fi
 
-python3 - "$timestamp_ns" "$test_message" <<'PY'
+python3 - "$timestamp_ns" "$test_message" <<EOF
 ```
 
 import json
@@ -176,7 +176,7 @@ payload = {
 }
 
 print(json.dumps(payload, separators=(",", ":")))
-PY
+EOF
 }
 
 push_validation_log() {
