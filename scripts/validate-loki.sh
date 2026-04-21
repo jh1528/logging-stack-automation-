@@ -152,9 +152,7 @@ if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
 	return 2
 fi
 
-python3 - "$timestamp_ns" "$test_message" <<EOF
-```
-
+python3 - "$timestamp_ns" "$test_message" <<'PY'
 import json
 import sys
 
@@ -162,22 +160,21 @@ timestamp_ns = sys.argv[1]
 test_message = sys.argv[2]
 
 payload = {
-"streams": [
-{
-"stream": {
-"job": "loki-validation",
-"source": "validate-loki.sh",
-},
-"values": [
-[timestamp_ns, test_message]
-],
-}
-]
+    "streams": [
+        {
+            "stream": {
+                "job": "loki-validation",
+                "source": "validate-loki.sh",
+            },
+            "values": [
+                [timestamp_ns, test_message]
+            ],
+        }
+    ]
 }
 
 print(json.dumps(payload, separators=(",", ":")))
-EOF
-}
+PY
 
 push_validation_log() {
 step "Pushing Loki validation log entry"
