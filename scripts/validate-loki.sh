@@ -26,9 +26,17 @@ LIB_DIR="${REPO_ROOT}/../infra-bash-lib"
 
 source "${LIB_DIR}/common.sh"
 
+# shellcheck source=../../infra-bash-lib/apt.sh
+
+source "${LIB_DIR}/apt.sh"
+
 # shellcheck source=../../infra-bash-lib/service.sh
 
 source "${LIB_DIR}/service.sh"
+
+# shellcheck source=../../infra-bash-lib/system.sh
+
+source "${LIB_DIR}/system.sh"
 
 # ==============================================================================
 
@@ -42,7 +50,7 @@ LOKI_BASE_URL="http://${LOKI_HTTP_HOST}:${LOKI_HTTP_PORT}"
 
 EXPECT_INGESTION="${EXPECT_INGESTION:-0}"
 
-LOKI_QUERY_RETRIES="${LOKI_QUERY_RETRIES:-12}"
+LOKI_QUERY_RETRIES="${LOKI_QUERY_RETRIES:-10}"
 LOKI_QUERY_SLEEP_SECONDS="${LOKI_QUERY_SLEEP_SECONDS:-2}"
 
 VALIDATION_STREAM_JOB="loki-validation"
@@ -50,7 +58,7 @@ VALIDATION_STREAM_SOURCE="validate-loki.sh"
 
 # ==============================================================================
 
-# Helpers
+# Internal helpers
 
 # ==============================================================================
 
@@ -58,37 +66,57 @@ require_root() {
 if [[ "${EUID}" -ne 0 ]]; then
 die "This script must be run as root"
 fi
+
+```
 pass "Running as root"
+return 0
+```
+
 }
 
 require_runtime_commands() {
 step "Checking validation command dependencies"
 
 ```
-command_exists curl >/dev/null || die "curl is required"
-command_exists ss >/dev/null || die "ss is required"
-command_exists python3 >/dev/null || die "python3 is required"
+command_exists curl >/dev/null || die "curl is required for Loki validation"
+command_exists ss >/dev/null || die "ss is required for listener validation"
+command_exists python3 >/dev/null || die "python3 is required for JSON-safe payload generation"
 
 pass "Required validation commands are available"
+return 0
 ```
 
 }
 
 validate_service_exists() {
 step "Checking Loki service registration"
+
+```
 service_exists loki || die "Loki service is not installed"
+return 0
+```
+
 }
 
 validate_service_running() {
 step "Checking Loki service status"
+
+```
 service_running loki || die "Loki service is not running"
+return 0
+```
+
 }
 
 validate_listener() {
 step "Checking Loki listener"
 
 ```
-if ss -lnt | awk '{print $4}' | grep -q ":${LOKI_HTTP_PORT}$"; then
+local listener_output
+
+listener_output="$(ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -E "(^|:)${LOKI_HTTP_PORT}$" || true)"
+
+if [[ -n "$listener_output" ]]; then
     pass "Port ${LOKI_HTTP_PORT} is listening"
     return 0
 fi
@@ -108,7 +136,7 @@ if curl -fsS "${LOKI_BASE_URL}/ready" >/dev/null 2>&1; then
     return 0
 fi
 
-fail "Loki readiness endpoint did not respond successfully"
+fail "Loki readiness endpoint did not respond successfully: ${LOKI_BASE_URL}/ready"
 return 2
 ```
 
@@ -119,21 +147,32 @@ local timestamp_ns="$1"
 local test_message="$2"
 
 ```
+if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
+    fail "Usage: build_validation_payload <timestamp_ns> <test_message>"
+    return 2
+fi
+
 python3 - "$timestamp_ns" "$test_message" <<'PY'
 ```
 
-import json, sys
+import json
+import sys
+
 timestamp_ns = sys.argv[1]
 test_message = sys.argv[2]
 
 payload = {
-"streams": [{
+"streams": [
+{
 "stream": {
 "job": "loki-validation",
-"source": "validate-loki.sh"
+"source": "validate-loki.sh",
 },
-"values": [[timestamp_ns, test_message]]
-}]
+"values": [
+[timestamp_ns, test_message]
+],
+}
+]
 }
 
 print(json.dumps(payload, separators=(",", ":")))
@@ -148,6 +187,11 @@ local timestamp_ns="$1"
 local test_message="$2"
 local payload
 
+if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
+    fail "Usage: push_validation_log <timestamp_ns> <test_message>"
+    return 2
+fi
+
 payload="$(build_validation_payload "$timestamp_ns" "$test_message")" || return 2
 
 if curl -fsS \
@@ -159,7 +203,7 @@ if curl -fsS \
     return 0
 fi
 
-fail "Failed to push validation log entry"
+fail "Failed to push validation log entry to Loki"
 return 2
 ```
 
@@ -171,9 +215,15 @@ local attempt
 local response_body
 
 ```
+if [[ -z "$test_message" ]]; then
+    fail "Usage: query_for_validation_log <test_message>"
+    return 2
+fi
+
 for (( attempt = 1; attempt <= LOKI_QUERY_RETRIES; attempt++ )); do
     info "Query attempt ${attempt}/${LOKI_QUERY_RETRIES}"
 
+    # PATCH: use query_range + time window instead of instant query
     response_body="$(curl -fsS \
         -G \
         --data-urlencode "query={job=\"${VALIDATION_STREAM_JOB}\",source=\"${VALIDATION_STREAM_SOURCE}\"}" \
@@ -217,6 +267,7 @@ push_validation_log "$timestamp_ns" "$test_message" || die "Loki push API valida
 query_for_validation_log "$test_message" || die "Loki query API validation failed"
 
 pass "Functional Loki ingestion/query validation succeeded"
+return 0
 ```
 
 }
@@ -236,13 +287,14 @@ else
 fi
 
 pass "Loki validation completed successfully"
+return 0
 ```
 
 }
 
 # ==============================================================================
 
-# Main
+# Main workflow
 
 # ==============================================================================
 
@@ -255,8 +307,8 @@ require_runtime_commands
 
 validate_service_exists
 validate_service_running
-validate_listener || die "Loki is not listening"
-validate_ready_endpoint || die "Loki readiness failed"
+validate_listener || die "Loki is not listening on the expected port"
+validate_ready_endpoint || die "Loki readiness endpoint validation failed"
 
 if [[ "$EXPECT_INGESTION" == "1" ]]; then
     run_functional_validation
