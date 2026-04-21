@@ -87,7 +87,7 @@ source "${LIB_DIR}/system.sh"
 
 # ==============================================================================
 # Configuration
-# ==============================================================================
+# =============et================================================================
 
 LOKI_HTTP_HOST="${LOKI_HTTP_HOST:-127.0.0.1}"
 LOKI_HTTP_PORT="${LOKI_HTTP_PORT:-3100}"
@@ -256,7 +256,11 @@ PY
 		response_body="$(curl -fsS \
 			-G \
 			--data-urlencode "query={job=\"${VALIDATION_STREAM_JOB}\",source=\"${VALIDATION_STREAM_SOURCE}\"}" \
-			"${LOKI_BASE_URL}/loki/api/v1/query" 2>/dev/null || true)"
+			--data-urlencode "start=$(($(date +%s%N) - 300000000000))" \
+			--data-urlencode "end=$(date +%s%N)" \
+			--data-urlencode "limit=50" \
+			--data-urlencode "direction=backward" \
+			"${LOKI_BASE_URL}/loki/api/v1/query_range" 2>/dev/null || true)"
 
 		if [[ -n "$response_body" ]] && grep -Fq "$test_message" <<<"$response_body"; then
 			pass "Validation log entry was returned by Loki query"
