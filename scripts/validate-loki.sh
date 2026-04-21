@@ -6,15 +6,7 @@
 
 #
 
-# Validates a Grafana Loki installation using staged validation.
-
-#
-
-# Modes:
-
-# - Readiness (default)
-
-# - Functional ingestion/query (EXPECT_INGESTION=1)
+# Validates a Grafana Loki installation in staged modes.
 
 #
 
@@ -22,7 +14,7 @@ set -u
 
 # ==============================================================================
 
-# Path + library loading
+# Path discovery and shared library loading
 
 # ==============================================================================
 
@@ -30,12 +22,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LIB_DIR="${REPO_ROOT}/../infra-bash-lib"
 
+# shellcheck source=../../infra-bash-lib/common.sh
+
 source "${LIB_DIR}/common.sh"
+
+# shellcheck source=../../infra-bash-lib/service.sh
+
 source "${LIB_DIR}/service.sh"
 
 # ==============================================================================
 
-# Config
+# Configuration
 
 # ==============================================================================
 
@@ -48,8 +45,8 @@ EXPECT_INGESTION="${EXPECT_INGESTION:-0}"
 LOKI_QUERY_RETRIES="${LOKI_QUERY_RETRIES:-12}"
 LOKI_QUERY_SLEEP_SECONDS="${LOKI_QUERY_SLEEP_SECONDS:-2}"
 
-STREAM_JOB="loki-validation"
-STREAM_SOURCE="validate-loki.sh"
+VALIDATION_STREAM_JOB="loki-validation"
+VALIDATION_STREAM_SOURCE="validate-loki.sh"
 
 # ==============================================================================
 
@@ -58,26 +55,36 @@ STREAM_SOURCE="validate-loki.sh"
 # ==============================================================================
 
 require_root() {
-[[ "$EUID" -eq 0 ]] || die "Must run as root"
+if [[ "${EUID}" -ne 0 ]]; then
+die "This script must be run as root"
+fi
 pass "Running as root"
 }
 
-require_commands() {
-step "Checking dependencies"
-command -v curl >/dev/null || die "curl required"
-command -v ss >/dev/null || die "ss required"
-command -v python3 >/dev/null || die "python3 required"
-pass "Required commands available"
+require_runtime_commands() {
+step "Checking validation command dependencies"
+
+```
+command_exists curl >/dev/null || die "curl is required"
+command_exists ss >/dev/null || die "ss is required"
+command_exists python3 >/dev/null || die "python3 is required"
+
+pass "Required validation commands are available"
+```
+
 }
 
-check_service() {
-step "Checking Loki service"
-service_exists loki || die "loki.service missing"
-service_running loki || die "loki.service not running"
-pass "Service is running: loki.service"
+validate_service_exists() {
+step "Checking Loki service registration"
+service_exists loki || die "Loki service is not installed"
 }
 
-check_listener() {
+validate_service_running() {
+step "Checking Loki service status"
+service_running loki || die "Loki service is not running"
+}
+
+validate_listener() {
 step "Checking Loki listener"
 
 ```
@@ -86,111 +93,146 @@ if ss -lnt | awk '{print $4}' | grep -q ":${LOKI_HTTP_PORT}$"; then
     return 0
 fi
 
-die "Port ${LOKI_HTTP_PORT} is not listening"
+fail "Port ${LOKI_HTTP_PORT} is not listening"
+return 2
 ```
 
 }
 
-check_ready() {
-step "Checking readiness endpoint"
+validate_ready_endpoint() {
+step "Checking Loki readiness endpoint"
 
 ```
-if curl -fsS "${LOKI_BASE_URL}/ready" >/dev/null; then
-    pass "Readiness endpoint OK: ${LOKI_BASE_URL}/ready"
+if curl -fsS "${LOKI_BASE_URL}/ready" >/dev/null 2>&1; then
+    pass "Loki readiness endpoint responded successfully: ${LOKI_BASE_URL}/ready"
     return 0
 fi
 
-die "Readiness endpoint failed"
+fail "Loki readiness endpoint did not respond successfully"
+return 2
 ```
 
 }
 
-build_payload() {
-python3 - <<EOF
-import json, time
-ts = str(int(time.time()*1e9))
-msg = "loki validation test message id=" + str(int(time.time()))
-print(json.dumps({
+build_validation_payload() {
+local timestamp_ns="$1"
+local test_message="$2"
+
+```
+python3 - "$timestamp_ns" "$test_message" <<'PY'
+```
+
+import json, sys
+timestamp_ns = sys.argv[1]
+test_message = sys.argv[2]
+
+payload = {
 "streams": [{
-"stream": {"job": "${STREAM_JOB}", "source": "${STREAM_SOURCE}"},
-"values": [[ts, msg]]
+"stream": {
+"job": "loki-validation",
+"source": "validate-loki.sh"
+},
+"values": [[timestamp_ns, test_message]]
 }]
-}))
-EOF
 }
 
-push_log() {
-step "Pushing validation log"
+print(json.dumps(payload, separators=(",", ":")))
+PY
+}
+
+push_validation_log() {
+step "Pushing Loki validation log entry"
 
 ```
-PAYLOAD="$(build_payload)"
+local timestamp_ns="$1"
+local test_message="$2"
+local payload
 
-echo "$PAYLOAD" > /tmp/loki_payload.json
+payload="$(build_validation_payload "$timestamp_ns" "$test_message")" || return 2
 
-curl -fsS -X POST \
+if curl -fsS \
+    -X POST \
     -H "Content-Type: application/json" \
-    --data-binary @/tmp/loki_payload.json \
-    "${LOKI_BASE_URL}/loki/api/v1/push" >/dev/null \
-    || die "Push failed"
+    --data-raw "$payload" \
+    "${LOKI_BASE_URL}/loki/api/v1/push" >/dev/null 2>&1; then
+    pass "Validation log entry pushed to Loki"
+    return 0
+fi
 
-TEST_MESSAGE="$(python3 -c "import json; print(json.load(open('/tmp/loki_payload.json'))['streams'][0]['values'][0][1])")"
-
-pass "Log pushed"
+fail "Failed to push validation log entry"
+return 2
 ```
 
 }
 
-query_log() {
-step "Querying for validation log"
+query_for_validation_log() {
+local test_message="$1"
+local attempt
+local response_body
 
 ```
-START_NS=$(($(date +%s%N) - 60000000000))
-END_NS=$(date +%s%N)
+for (( attempt = 1; attempt <= LOKI_QUERY_RETRIES; attempt++ )); do
+    info "Query attempt ${attempt}/${LOKI_QUERY_RETRIES}"
 
-for ((i=1;i<=LOKI_QUERY_RETRIES;i++)); do
-    info "Query attempt $i/${LOKI_QUERY_RETRIES}"
-
-    RESPONSE="$(curl -fsS -G \
-        --data-urlencode "query={job=\"${STREAM_JOB}\",source=\"${STREAM_SOURCE}\"}" \
-        --data-urlencode "start=${START_NS}" \
-        --data-urlencode "end=${END_NS}" \
+    response_body="$(curl -fsS \
+        -G \
+        --data-urlencode "query={job=\"${VALIDATION_STREAM_JOB}\",source=\"${VALIDATION_STREAM_SOURCE}\"}" \
+        --data-urlencode "start=$(($(date +%s%N) - 60000000000))" \
+        --data-urlencode "end=$(date +%s%N)" \
         --data-urlencode "limit=10" \
         "${LOKI_BASE_URL}/loki/api/v1/query_range" 2>/dev/null || true)"
 
-    if [[ -n "$RESPONSE" ]] && grep -Fq "$TEST_MESSAGE" <<<"$RESPONSE"; then
-        pass "Log successfully retrieved from Loki"
+    if [[ -n "$response_body" ]] && grep -Fq "$test_message" <<<"$response_body"; then
+        pass "Validation log entry was returned by Loki query"
         return 0
     fi
 
-    sleep "$LOKI_QUERY_SLEEP_SECONDS"
+    if (( attempt < LOKI_QUERY_RETRIES )); then
+        info "Validation log entry not returned yet; waiting ${LOKI_QUERY_SLEEP_SECONDS}s"
+        sleep "$LOKI_QUERY_SLEEP_SECONDS"
+    fi
 done
 
-die "Log not found after retries"
+fail "Validation log entry was not returned by Loki after ${LOKI_QUERY_RETRIES} attempts"
+return 2
 ```
 
 }
 
-functional_test() {
-step "Running functional validation"
+run_functional_validation() {
+step "Running Loki functional validation"
 
 ```
-push_log
-query_log
+local timestamp_ns
+local test_id
+local test_message
 
-pass "Functional validation passed"
+timestamp_ns="$(date +%s%N)"
+test_id="$(date +%s)"
+test_message="loki validation test message id=${test_id}"
+
+info "Validation message: ${test_message}"
+
+push_validation_log "$timestamp_ns" "$test_message" || die "Loki push API validation failed"
+query_for_validation_log "$test_message" || die "Loki query API validation failed"
+
+pass "Functional Loki ingestion/query validation succeeded"
 ```
 
 }
 
-summary() {
-step "Validation summary"
+print_validation_summary() {
+step "Loki validation summary"
+
+```
+info "Service: loki.service"
 info "Endpoint: ${LOKI_BASE_URL}"
+info "Readiness mode: enabled"
 
-```
 if [[ "$EXPECT_INGESTION" == "1" ]]; then
-    info "Functional test: enabled"
+    info "Functional ingestion/query validation: enabled"
 else
-    info "Functional test: skipped"
+    info "Functional ingestion/query validation: skipped"
 fi
 
 pass "Loki validation completed successfully"
@@ -209,19 +251,20 @@ step "Starting Loki validation"
 
 ```
 require_root
-require_commands
+require_runtime_commands
 
-check_service
-check_listener
-check_ready
+validate_service_exists
+validate_service_running
+validate_listener || die "Loki is not listening"
+validate_ready_endpoint || die "Loki readiness failed"
 
 if [[ "$EXPECT_INGESTION" == "1" ]]; then
-    functional_test
+    run_functional_validation
 else
-    info "EXPECT_INGESTION not set; skipping functional test"
+    info "EXPECT_INGESTION is not enabled; functional push/query validation skipped"
 fi
 
-summary
+print_validation_summary
 ```
 
 }
