@@ -117,8 +117,8 @@ local listener_output
 listener_output="$(ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -E "(^|:)${LOKI_HTTP_PORT}$" || true)"
 
 if [[ -n "$listener_output" ]]; then
-    pass "Port ${LOKI_HTTP_PORT} is listening"
-    return 0
+	pass "Port ${LOKI_HTTP_PORT} is listening"
+	return 0
 fi
 
 fail "Port ${LOKI_HTTP_PORT} is not listening"
@@ -132,8 +132,8 @@ step "Checking Loki readiness endpoint"
 
 ```
 if curl -fsS "${LOKI_BASE_URL}/ready" >/dev/null 2>&1; then
-    pass "Loki readiness endpoint responded successfully: ${LOKI_BASE_URL}/ready"
-    return 0
+	pass "Loki readiness endpoint responded successfully: ${LOKI_BASE_URL}/ready"
+	return 0
 fi
 
 fail "Loki readiness endpoint did not respond successfully: ${LOKI_BASE_URL}/ready"
@@ -143,15 +143,18 @@ return 2
 }
 
 build_validation_payload() {
-    local timestamp_ns="$1"
-    local test_message="$2"
+local timestamp_ns="$1"
+local test_message="$2"
 
-    if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
-        fail "Usage: build_validation_payload <timestamp_ns> <test_message>"
-        return 2
-    fi
+```
+if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
+	fail "Usage: build_validation_payload <timestamp_ns> <test_message>"
+	return 2
+fi
 
-    python3 - "$timestamp_ns" "$test_message" <<EOF
+python3 - "$timestamp_ns" "$test_message" <<'PY'
+```
+
 import json
 import sys
 
@@ -159,22 +162,23 @@ timestamp_ns = sys.argv[1]
 test_message = sys.argv[2]
 
 payload = {
-    "streams": [
-        {
-            "stream": {
-                "job": "loki-validation",
-                "source": "validate-loki.sh"
-            },
-            "values": [
-                [timestamp_ns, test_message]
-            ]
-        }
-    ]
+"streams": [
+{
+"stream": {
+"job": "loki-validation",
+"source": "validate-loki.sh",
+},
+"values": [
+[timestamp_ns, test_message]
+],
+}
+]
 }
 
 print(json.dumps(payload, separators=(",", ":")))
-EOF
+PY
 }
+
 push_validation_log() {
 step "Pushing Loki validation log entry"
 
@@ -184,19 +188,19 @@ local test_message="$2"
 local payload
 
 if [[ -z "$timestamp_ns" || -z "$test_message" ]]; then
-    fail "Usage: push_validation_log <timestamp_ns> <test_message>"
-    return 2
+	fail "Usage: push_validation_log <timestamp_ns> <test_message>"
+	return 2
 fi
 
 payload="$(build_validation_payload "$timestamp_ns" "$test_message")" || return 2
 
 if curl -fsS \
-    -X POST \
-    -H "Content-Type: application/json" \
-    --data-raw "$payload" \
-    "${LOKI_BASE_URL}/loki/api/v1/push" >/dev/null 2>&1; then
-    pass "Validation log entry pushed to Loki"
-    return 0
+	-X POST \
+	-H "Content-Type: application/json" \
+	--data-raw "$payload" \
+	"${LOKI_BASE_URL}/loki/api/v1/push" >/dev/null 2>&1; then
+	pass "Validation log entry pushed to Loki"
+	return 0
 fi
 
 fail "Failed to push validation log entry to Loki"
@@ -212,31 +216,30 @@ local response_body
 
 ```
 if [[ -z "$test_message" ]]; then
-    fail "Usage: query_for_validation_log <test_message>"
-    return 2
+	fail "Usage: query_for_validation_log <test_message>"
+	return 2
 fi
 
 for (( attempt = 1; attempt <= LOKI_QUERY_RETRIES; attempt++ )); do
-    info "Query attempt ${attempt}/${LOKI_QUERY_RETRIES}"
+	info "Query attempt ${attempt}/${LOKI_QUERY_RETRIES}"
 
-    # PATCH: use query_range + time window instead of instant query
-    response_body="$(curl -fsS \
-        -G \
-        --data-urlencode "query={job=\"${VALIDATION_STREAM_JOB}\",source=\"${VALIDATION_STREAM_SOURCE}\"}" \
-        --data-urlencode "start=$(($(date +%s%N) - 60000000000))" \
-        --data-urlencode "end=$(date +%s%N)" \
-        --data-urlencode "limit=10" \
-        "${LOKI_BASE_URL}/loki/api/v1/query_range" 2>/dev/null || true)"
+	response_body="$(curl -fsS \
+		-G \
+		--data-urlencode "query={job=\"${VALIDATION_STREAM_JOB}\",source=\"${VALIDATION_STREAM_SOURCE}\"}" \
+		--data-urlencode "start=$(($(date +%s%N) - 60000000000))" \
+		--data-urlencode "end=$(date +%s%N)" \
+		--data-urlencode "limit=10" \
+		"${LOKI_BASE_URL}/loki/api/v1/query_range" 2>/dev/null || true)"
 
-    if [[ -n "$response_body" ]] && grep -Fq "$test_message" <<<"$response_body"; then
-        pass "Validation log entry was returned by Loki query"
-        return 0
-    fi
+	if [[ -n "$response_body" ]] && grep -Fq "$test_message" <<<"$response_body"; then
+		pass "Validation log entry was returned by Loki query"
+		return 0
+	fi
 
-    if (( attempt < LOKI_QUERY_RETRIES )); then
-        info "Validation log entry not returned yet; waiting ${LOKI_QUERY_SLEEP_SECONDS}s"
-        sleep "$LOKI_QUERY_SLEEP_SECONDS"
-    fi
+	if (( attempt < LOKI_QUERY_RETRIES )); then
+		info "Validation log entry not returned yet; waiting ${LOKI_QUERY_SLEEP_SECONDS}s"
+		sleep "$LOKI_QUERY_SLEEP_SECONDS"
+	fi
 done
 
 fail "Validation log entry was not returned by Loki after ${LOKI_QUERY_RETRIES} attempts"
@@ -277,9 +280,9 @@ info "Endpoint: ${LOKI_BASE_URL}"
 info "Readiness mode: enabled"
 
 if [[ "$EXPECT_INGESTION" == "1" ]]; then
-    info "Functional ingestion/query validation: enabled"
+	info "Functional ingestion/query validation: enabled"
 else
-    info "Functional ingestion/query validation: skipped"
+	info "Functional ingestion/query validation: skipped"
 fi
 
 pass "Loki validation completed successfully"
@@ -307,9 +310,9 @@ validate_listener || die "Loki is not listening on the expected port"
 validate_ready_endpoint || die "Loki readiness endpoint validation failed"
 
 if [[ "$EXPECT_INGESTION" == "1" ]]; then
-    run_functional_validation
+	run_functional_validation
 else
-    info "EXPECT_INGESTION is not enabled; functional push/query validation skipped"
+	info "EXPECT_INGESTION is not enabled; functional push/query validation skipped"
 fi
 
 print_validation_summary
