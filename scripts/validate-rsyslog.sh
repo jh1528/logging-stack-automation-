@@ -2,24 +2,74 @@
 #
 # validate-rsyslog.sh
 #
-# Validates rsyslog as the required centralized logging layer.
-# Supports two validation modes:
+# Validates rsyslog as the centralized log collection layer.
 #
-#   1. Readiness mode (default)
-#      - Validates installation, service, config, listener, and directory setup
-#      - Does NOT pretend loopback traffic is a real remote sender
+# Purpose:
+#  - Verify rsyslog is installed and running
+#  - Verify remote syslog configuration is present and valid
+#  - Verify port 514 listener availability
+#  - Verify the remote log directory is prepared
+#  - Optionally verify a real external sender writes a test message to disk
 #
-#   2. Remote sender mode
-#      - Waits for a real external sender (for example: Proxmox host)
-#      - Verifies the test message is written under /var/log/remote
+# Design:
+#  - Follow the staged-model used by the logging stack project
+#  - Keep validation first-class and fail fast on critical checks
+#  - Avoid fake loopback assumptions where real remote behavior matters
+#  - Support readiness validation by default
+#  - Support true remote sender validation when explicitly enabled
 #
-# Environment variables:
-#   LIB_DIR                 Override shared library path
-#   ENABLE_TCP_SYSLOG       1 to enable TCP 514 listener, default 0
-#   EXPECT_REMOTE_SENDER    1 to require a real external sender, default 0
-#   REMOTE_SENDER_HOSTNAME  Optional expected sender hostname directory under /var/log/remote
-#   REMOTE_TEST_TIMEOUT     Seconds to wait for remote test log, default 30
-#   REMOTE_TEST_POLL_INTERVAL Seconds between checks, default 2
+# Validation Modes:
+#  1. Readiness Mode (default)
+#     - Validates installation, service, config, listener, and directory setup
+#     - Does NOT pretend loopback traffic is a real remote sender
+#
+#  2. Remote Sender Mode
+#     - Enabled with EXPECT_REMOTE_SENDER=1
+#     - Waits for a real external sender
+#     - Verifies the test message is written under /var/log/remote
+#
+# Preconditions:
+#  - Script is run with sufficient privileges
+#  - Required library files are present and sourceable
+#
+# Postconditions:
+#  - Readiness mode confirms rsyslog layer health
+#  - Remote sender mode confirms real remote log write behavior
+#
+# Environment Variables:
+#  - LIB_DIR
+#      Override shared library path
+#      Default: /home/graylog/infra-bash-lib
+#
+#  - ENABLE_TCP_SYSLOG
+#      Set to 1 to enable TCP 514 listener in generated config
+#      Default: 0
+#
+#  - EXPECT_REMOTE_SENDER
+#      Set to 1 to require a real external sender
+#      Default: 0
+#
+#  - REMOTE_SENDER_HOSTNAME
+#      Optional expected sender hostname directory under /var/log/remote
+#      Default: unset
+#
+#  - REMOTE_TEST_TIMEOUT
+#      Seconds to wait for remote test log
+#      Default: 30
+#
+#  - REMOTE_TEST_POLL_INTERVAL
+#      Seconds between checks
+#      Default: 2
+#
+# Usage:
+#  sudo ./scripts/validate-rsyslog.sh
+#
+# Real remote sender validation:
+#  sudo EXPECT_REMOTE_SENDER=1 ./scripts/validate-rsyslog.sh
+#
+# Returns:
+#  - 0 if validation succeeds
+#  - 2 if a critical validation step fails
 #
 
 set -u
@@ -27,12 +77,27 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# ------------------------------------------------------------------------------
+# External reusable library location
+# ------------------------------------------------------------------------------
+# Priority:
+#   1. LIB_DIR environment variable, if exported by caller
+#   2. Default shared reusable library path
+#
+# Example:
+#   export LIB_DIR="/home/graylog/infra-bash-lib"
+#   sudo ./scripts/validate-rsyslog.sh
+#
 readonly DEFAULT_LIB_DIR="/home/graylog/infra-bash-lib"
 readonly LIB_DIR="${LIB_DIR:-${DEFAULT_LIB_DIR}}"
 
 COMMON_LIB="${LIB_DIR}/common.sh"
 SERVICE_LIB="${LIB_DIR}/service.sh"
 SYSTEM_LIB="${LIB_DIR}/system.sh"
+
+# ------------------------------------------------------------------------------
+# Library loading
+# ------------------------------------------------------------------------------
 
 [[ -f "${COMMON_LIB}"  ]] || { echo "[FAIL] Missing library: ${COMMON_LIB}"; exit 2; }
 [[ -f "${SERVICE_LIB}" ]] || { echo "[FAIL] Missing library: ${SERVICE_LIB}"; exit 2; }
@@ -45,18 +110,42 @@ source "${SERVICE_LIB}"
 # shellcheck source=/dev/null
 source "${SYSTEM_LIB}"
 
+# ------------------------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------------------------
+
 readonly RSYSLOG_SERVICE="rsyslog"
 readonly RSYSLOG_CONFIG_FILE="/etc/rsyslog.d/10-remote.conf"
 readonly REMOTE_LOG_DIR="/var/log/remote"
+
 readonly TEST_MESSAGE_TAG="rsyslog-validation"
 readonly TEST_MESSAGE="rsyslog validation test message"
-readonly ENABLE_TCP_SYSLOG="${ENABLE_TCP_SYSLOG:-0}"
 
+readonly ENABLE_TCP_SYSLOG="${ENABLE_TCP_SYSLOG:-0}"
 readonly EXPECT_REMOTE_SENDER="${EXPECT_REMOTE_SENDER:-0}"
 readonly REMOTE_SENDER_HOSTNAME="${REMOTE_SENDER_HOSTNAME:-}"
 readonly REMOTE_TEST_TIMEOUT="${REMOTE_TEST_TIMEOUT:-30}"
 readonly REMOTE_TEST_POLL_INTERVAL="${REMOTE_TEST_POLL_INTERVAL:-2}"
 
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+#
+# require_root
+# Description:
+#  - Verifies the script is running with root privileges.
+#
+# Preconditions:
+#  - None
+#
+# Postconditions:
+#  - A formatted PASS or FAIL message is printed
+#
+# Returns:
+#  - 0 if running as root
+#  - 2 if not running as root
+#
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
         fail "This script must be run as root"
@@ -67,6 +156,22 @@ require_root() {
     return 0
 }
 
+#
+# require_commands
+# Description:
+#  - Verifies the commands required for rsyslog validation are available.
+#  - Supports either ss or netstat for listener validation.
+#
+# Preconditions:
+#  - Shared system helper library is sourced
+#
+# Postconditions:
+#  - Required validation commands are available
+#
+# Returns:
+#  - 0 if command validation succeeds
+#  - 2 if a critical command is missing
+#
 require_commands() {
     step "Phase 1 — Required command checks"
 
@@ -75,6 +180,7 @@ require_commands() {
     command_exists grep || return 2
     command_exists awk || return 2
     command_exists sleep || return 2
+    command_exists find || return 2
 
     if command_exists ss >/dev/null 2>&1; then
         pass "Socket inspection command available: ss"
@@ -90,6 +196,22 @@ require_commands() {
     return 2
 }
 
+#
+# check_rsyslog_service
+# Description:
+#  - Verifies the rsyslog service exists and is running.
+#
+# Preconditions:
+#  - Shared service helper library is sourced
+#
+# Postconditions:
+#  - rsyslog.service exists
+#  - rsyslog.service is running
+#
+# Returns:
+#  - 0 if service validation succeeds
+#  - 2 if a critical service check fails
+#
 check_rsyslog_service() {
     step "Phase 2 — Service validation"
 
@@ -100,6 +222,21 @@ check_rsyslog_service() {
     return 0
 }
 
+#
+# prepare_remote_log_directory
+# Description:
+#  - Verifies the remote log directory exists and is accessible.
+#
+# Preconditions:
+#  - Shared system helper library is sourced
+#
+# Postconditions:
+#  - /var/log/remote exists
+#
+# Returns:
+#  - 0 if directory validation succeeds
+#  - 2 if a critical directory check fails
+#
 prepare_remote_log_directory() {
     step "Phase 3 — Remote log directory validation"
 
@@ -110,6 +247,23 @@ prepare_remote_log_directory() {
     return 0
 }
 
+#
+# write_rsyslog_remote_config
+# Description:
+#  - Writes the rsyslog remote input and remote file storage configuration.
+#  - Enables UDP 514 by default and TCP 514 optionally.
+#
+# Preconditions:
+#  - Remote log directory exists
+#  - Shared filesystem helper functions are sourced
+#
+# Postconditions:
+#  - /etc/rsyslog.d/10-remote.conf exists
+#
+# Returns:
+#  - 0 if config writing succeeds
+#  - 2 if config writing fails
+#
 write_rsyslog_remote_config() {
     step "Phase 4 — Write rsyslog remote logging configuration"
 
@@ -140,6 +294,21 @@ EOF
     return 0
 }
 
+#
+# validate_rsyslog_config
+# Description:
+#  - Validates rsyslog configuration syntax.
+#
+# Preconditions:
+#  - rsyslog config file exists
+#
+# Postconditions:
+#  - rsyslogd syntax validation succeeds
+#
+# Returns:
+#  - 0 if configuration is valid
+#  - 2 if configuration validation fails
+#
 validate_rsyslog_config() {
     step "Phase 5 — rsyslog configuration syntax check"
 
@@ -152,6 +321,22 @@ validate_rsyslog_config() {
     return 2
 }
 
+#
+# restart_rsyslog_service
+# Description:
+#  - Restarts rsyslog after configuration changes and confirms it is running.
+#
+# Preconditions:
+#  - rsyslog config is valid
+#
+# Postconditions:
+#  - rsyslog is restarted
+#  - rsyslog is running
+#
+# Returns:
+#  - 0 if restart succeeds
+#  - 2 if restart fails
+#
 restart_rsyslog_service() {
     step "Phase 6 — Restart rsyslog"
 
@@ -166,6 +351,21 @@ restart_rsyslog_service() {
     return 0
 }
 
+#
+# is_udp_514_listening_with_ss
+# Description:
+#  - Checks whether UDP 514 is listening using ss.
+#
+# Preconditions:
+#  - ss command is available
+#
+# Postconditions:
+#  - Exit status reflects listener presence
+#
+# Returns:
+#  - 0 if UDP 514 is listening
+#  - 1 if UDP 514 is not listening
+#
 is_udp_514_listening_with_ss() {
     ss -H -lun 2>/dev/null | awk '
         $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
@@ -173,6 +373,21 @@ is_udp_514_listening_with_ss() {
     '
 }
 
+#
+# is_tcp_514_listening_with_ss
+# Description:
+#  - Checks whether TCP 514 is listening using ss.
+#
+# Preconditions:
+#  - ss command is available
+#
+# Postconditions:
+#  - Exit status reflects listener presence
+#
+# Returns:
+#  - 0 if TCP 514 is listening
+#  - 1 if TCP 514 is not listening
+#
 is_tcp_514_listening_with_ss() {
     ss -H -ltn 2>/dev/null | awk '
         $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
@@ -180,6 +395,21 @@ is_tcp_514_listening_with_ss() {
     '
 }
 
+#
+# is_udp_514_listening_with_netstat
+# Description:
+#  - Checks whether UDP 514 is listening using netstat.
+#
+# Preconditions:
+#  - netstat command is available
+#
+# Postconditions:
+#  - Exit status reflects listener presence
+#
+# Returns:
+#  - 0 if UDP 514 is listening
+#  - 1 if UDP 514 is not listening
+#
 is_udp_514_listening_with_netstat() {
     netstat -lun 2>/dev/null | awk '
         $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
@@ -187,6 +417,21 @@ is_udp_514_listening_with_netstat() {
     '
 }
 
+#
+# is_tcp_514_listening_with_netstat
+# Description:
+#  - Checks whether TCP 514 is listening using netstat.
+#
+# Preconditions:
+#  - netstat command is available
+#
+# Postconditions:
+#  - Exit status reflects listener presence
+#
+# Returns:
+#  - 0 if TCP 514 is listening
+#  - 1 if TCP 514 is not listening
+#
 is_tcp_514_listening_with_netstat() {
     netstat -ltn 2>/dev/null | awk '
         $0 ~ /(^|[[:space:]])[^[:space:]]+:514([[:space:]]|$)/ { found=1 }
@@ -194,6 +439,22 @@ is_tcp_514_listening_with_netstat() {
     '
 }
 
+#
+# check_syslog_port
+# Description:
+#  - Verifies UDP 514 is listening.
+#  - Verifies TCP 514 is listening when explicitly enabled.
+#
+# Preconditions:
+#  - rsyslog has been restarted successfully
+#
+# Postconditions:
+#  - Listener validation is completed
+#
+# Returns:
+#  - 0 if port validation succeeds
+#  - 2 if port validation fails
+#
 check_syslog_port() {
     step "Phase 7 — Listener validation"
 
@@ -249,8 +510,23 @@ check_syslog_port() {
     return 2
 }
 
+#
+# send_test_message
+# Description:
+#  - In readiness mode, explicitly skips self-injection by design.
+#  - In remote sender mode, prints instructions for a real remote sender.
+#
+# Preconditions:
+#  - Listener validation has completed
+#
+# Postconditions:
+#  - Operator is informed of the expected sender behavior
+#
+# Returns:
+#  - 0 if the phase completes successfully
+#
 send_test_message() {
-    step "Phase 8 — Test message injection"
+    step "Phase 8 — Test message phase"
 
     if [[ "${EXPECT_REMOTE_SENDER}" == "1" ]]; then
         info "Remote sender mode enabled"
@@ -261,7 +537,7 @@ send_test_message() {
         info "logger -n <this-server-ip> -P 514 -d -t '${TEST_MESSAGE_TAG}' -- '${TEST_MESSAGE}'"
 
         if [[ "${ENABLE_TCP_SYSLOG}" == "1" ]]; then
-            info "TCP is enabled, but this example still uses UDP unless your sender is changed to TCP explicitly"
+            info "TCP is enabled, but the example still uses UDP unless the sender is changed explicitly"
         fi
 
         pass "Remote sender instructions issued"
@@ -269,11 +545,28 @@ send_test_message() {
     fi
 
     warn "Skipping self-injection because loopback traffic is not a trustworthy remote syslog test"
-    info "Set EXPECT_REMOTE_SENDER=1 and send the test message from another machine such as the Proxmox host"
+    info "Set EXPECT_REMOTE_SENDER=1 and send the test message from another machine"
     pass "Self-injection skipped by design"
     return 0
 }
 
+#
+# verify_test_log_written
+# Description:
+#  - In remote sender mode, waits for the expected test message to appear
+#    under /var/log/remote.
+#  - In readiness mode, skips remote write validation by design.
+#
+# Preconditions:
+#  - rsyslog is listening for remote messages
+#
+# Postconditions:
+#  - Remote sender mode confirms the test message is written to disk
+#
+# Returns:
+#  - 0 if validation succeeds
+#  - 2 if validation fails
+#
 verify_test_log_written() {
     step "Phase 9 — Log write validation"
 
@@ -325,6 +618,20 @@ verify_test_log_written() {
     return 2
 }
 
+#
+# print_success_summary
+# Description:
+#  - Prints a concise validation summary.
+#
+# Preconditions:
+#  - Validation phases completed successfully
+#
+# Postconditions:
+#  - Summary information is printed to stdout
+#
+# Returns:
+#  - 0
+#
 print_success_summary() {
     step "Validation Summary"
 
@@ -342,7 +649,12 @@ print_success_summary() {
 
     info "rsyslog layer is ready for upper logging stack components"
     info "Next stages: Loki, Grafana, and Promtail"
+    return 0
 }
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 
 main() {
     step "Validate rsyslog"
