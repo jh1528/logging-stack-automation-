@@ -84,6 +84,14 @@
 #      Grafana HTTP port
 #      Default: 3000
 #
+#  - HTTP_ENDPOINT_RETRIES
+#      Number of endpoint readiness attempts after service restart
+#      Default: 15
+#
+#  - HTTP_ENDPOINT_SLEEP_SECONDS
+#      Seconds to sleep between endpoint readiness attempts
+#      Default: 2
+#
 #  - PROMTAIL_HTTP_PORT
 #      Promtail HTTP listen port
 #      Default: 9080
@@ -165,6 +173,9 @@ readonly GRAFANA_BASE_URL="http://${GRAFANA_HTTP_HOST}:${GRAFANA_HTTP_PORT}"
 
 readonly PROMTAIL_JOB_NAME="system_remote_logs"
 readonly PROMTAIL_LOKI_LABEL_JOB="rsyslog"
+
+readonly HTTP_ENDPOINT_RETRIES="${HTTP_ENDPOINT_RETRIES:-15}"
+readonly HTTP_ENDPOINT_SLEEP_SECONDS="${HTTP_ENDPOINT_SLEEP_SECONDS:-2}"
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -576,9 +587,55 @@ validate_local_services_running() {
 }
 
 #
+# wait_for_http_endpoint
+# Description:
+#  - Waits for an HTTP endpoint to respond successfully.
+#  - Retries because services can be marked running by systemd before their HTTP
+#    readiness endpoint is available.
+#
+# Preconditions:
+#  - curl is available
+#  - Accepts two arguments:
+#    1. Human-readable endpoint name
+#    2. Endpoint URL
+#
+# Postconditions:
+#  - Endpoint has responded successfully, or retries have been exhausted
+#
+# Returns:
+#  - 0 if endpoint responds successfully
+#  - 2 if endpoint does not respond successfully after all attempts
+#
+wait_for_http_endpoint() {
+    local endpoint_name="$1"
+    local endpoint_url="$2"
+    local attempt
+
+    if [[ -z "${endpoint_name}" || -z "${endpoint_url}" ]]; then
+        fail "Usage: wait_for_http_endpoint <name> <url>"
+        return 2
+    fi
+
+    for (( attempt=1; attempt<=HTTP_ENDPOINT_RETRIES; attempt++ )); do
+        if curl -fsS "${endpoint_url}" >/dev/null 2>&1; then
+            pass "${endpoint_name} responded successfully: ${endpoint_url}"
+            return 0
+        fi
+
+        info "Waiting for ${endpoint_name}: attempt ${attempt}/${HTTP_ENDPOINT_RETRIES}"
+        sleep "${HTTP_ENDPOINT_SLEEP_SECONDS}"
+    done
+
+    fail "${endpoint_name} did not respond successfully after ${HTTP_ENDPOINT_RETRIES} attempts: ${endpoint_url}"
+    return 2
+}
+
+#
 # validate_http_endpoints
 # Description:
 #  - Verifies Loki and Grafana HTTP endpoints respond successfully after setup.
+#  - Uses retries because service restart completion does not guarantee HTTP
+#    readiness has completed.
 #
 # Preconditions:
 #  - curl is available
@@ -595,19 +652,8 @@ validate_local_services_running() {
 validate_http_endpoints() {
     step "Phase 9 — Post-setup HTTP endpoint checks"
 
-    if curl -fsS "${LOKI_BASE_URL}/ready" >/dev/null 2>&1; then
-        pass "Loki readiness endpoint responded successfully: ${LOKI_BASE_URL}/ready"
-    else
-        fail "Loki readiness endpoint did not respond successfully: ${LOKI_BASE_URL}/ready"
-        return 2
-    fi
-
-    if curl -fsS "${GRAFANA_BASE_URL}/login" >/dev/null 2>&1; then
-        pass "Grafana HTTP endpoint responded successfully: ${GRAFANA_BASE_URL}/login"
-    else
-        fail "Grafana HTTP endpoint did not respond successfully: ${GRAFANA_BASE_URL}/login"
-        return 2
-    fi
+    wait_for_http_endpoint "Loki readiness endpoint" "${LOKI_BASE_URL}/ready" || return 2
+    wait_for_http_endpoint "Grafana HTTP endpoint" "${GRAFANA_BASE_URL}/login" || return 2
 
     pass "Post-setup HTTP endpoint checks completed"
     return 0
